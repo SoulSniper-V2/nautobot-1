@@ -721,6 +721,8 @@ class ApproverDashboardView(ObjectListViewMixin):
         """
         Override the template names to use the custom dashboard template.
         """
+        if self.request.headers.get("HX-Request", False):
+            return super().get_template_name()
         return self.template_name
 
     def get_extra_context(self, request, instance):
@@ -743,10 +745,11 @@ class ApproverDashboardView(ObjectListViewMixin):
         """
         Override the list method to display a helpful message regarding the page.
         """
-        messages.info(
-            request,
-            "You are viewing a dashboard of approval workflow stages that are pending for your approval.",
-        )
+        if not self.request.headers.get("HX-Request", False):
+            messages.info(
+                request,
+                "You are viewing a dashboard of approval workflow stages that are pending for your approval.",
+            )
         return super().list(request, *args, **kwargs)
 
 
@@ -766,6 +769,8 @@ class ApproveeDashboardView(ObjectListViewMixin):
         """
         Override the template names to use the custom dashboard template.
         """
+        if self.request.headers.get("HX-Request", False):
+            return super().get_template_name()
         return self.template_name
 
     def get_extra_context(self, request, instance):
@@ -790,10 +795,11 @@ class ApproveeDashboardView(ObjectListViewMixin):
         """
         Override the list method to display a helpful message regarding the page.
         """
-        messages.info(
-            request,
-            "You are viewing a dashboard of approval workflows that are requested by you.",
-        )
+        if not self.request.headers.get("HX-Request", False):
+            messages.info(
+                request,
+                "You are viewing a dashboard of approval workflows that are requested by you.",
+            )
         return super().list(request, *args, **kwargs)
 
 
@@ -2870,34 +2876,57 @@ class JobUIViewSet(NautobotUIViewSet):
             ignore_singleton_lock = job_execution_form.cleaned_data.get("_ignore_singleton_lock", False)
             schedule_type = schedule_form.cleaned_data["_schedule_type"]
 
-            with transaction.atomic():
-                scheduled_job = ScheduledJob.create_schedule(
-                    job_model,
-                    request.user,
-                    name=schedule_form.cleaned_data.get("_schedule_name"),
-                    start_time=schedule_form.cleaned_data.get("_schedule_start_time"),
-                    interval=schedule_type,
-                    crontab=schedule_form.cleaned_data.get("_recurrence_custom_time"),
-                    job_queue=job_queue,
-                    profile=profile,
-                    console_log=console_log,
-                    ignore_singleton_lock=ignore_singleton_lock,
-                    job_kwargs=job_class.serialize_data(job_form.cleaned_data),
-                )
-                scheduled_job_has_approval_workflow = scheduled_job.has_approval_workflow_definition()
-                is_scheduled = schedule_type in JobExecutionType.SCHEDULE_CHOICES
-                if job_model.has_sensitive_variables and scheduled_job_has_approval_workflow:
-                    messages.error(
-                        request,
-                        "Unable to run or schedule job: "
-                        "This job is flagged as possibly having sensitive variables but also has an applicable approval workflow definition."
-                        "Modify or remove the approval workflow definition or modify the job to set `has_sensitive_variables` to False.",
+            try:
+                with transaction.atomic():
+                    scheduled_job = ScheduledJob.create_schedule(
+                        job_model,
+                        request.user,
+                        name=schedule_form.cleaned_data.get("_schedule_name"),
+                        start_time=schedule_form.cleaned_data.get("_schedule_start_time"),
+                        interval=schedule_type,
+                        crontab=schedule_form.cleaned_data.get("_recurrence_custom_time"),
+                        job_queue=job_queue,
+                        profile=profile,
+                        console_log=console_log,
+                        ignore_singleton_lock=ignore_singleton_lock,
+                        job_kwargs=job_class.serialize_data(job_form.cleaned_data),
                     )
-                    scheduled_job.delete()
-                    del scheduled_job
-                else:
-                    if dryrun and not is_scheduled:
-                        # Enqueue job for immediate execution when dryrun and (no schedule, no has_sensitive_variables)
+                    scheduled_job_has_approval_workflow = scheduled_job.has_approval_workflow_definition()
+                    is_scheduled = schedule_type in JobExecutionType.SCHEDULE_CHOICES
+                    if job_model.has_sensitive_variables and scheduled_job_has_approval_workflow:
+                        messages.error(
+                            request,
+                            "Unable to run or schedule job: "
+                            "This job is flagged as possibly having sensitive variables but also has an applicable approval workflow definition."
+                            "Modify or remove the approval workflow definition or modify the job to set `has_sensitive_variables` to False.",
+                        )
+                        scheduled_job.delete()
+                        del scheduled_job
+                    else:
+                        if dryrun and not is_scheduled:
+                            # Enqueue job for immediate execution when dryrun and (no schedule, no has_sensitive_variables)
+                            scheduled_job.delete()
+                            del scheduled_job
+                            return self._handle_immediate_execution(
+                                request,
+                                job_model,
+                                job_class,
+                                job_form,
+                                profile,
+                                ignore_singleton_lock,
+                                job_queue,
+                                console_log,
+                                return_url,
+                            )
+                        # Step 1: Check if approval is required
+                        if scheduled_job_has_approval_workflow:
+                            return self._handle_approval_workflow_response(request, scheduled_job, return_url)
+
+                        # Step 3: If approval is not required
+                        if is_scheduled:
+                            return self._handle_scheduled_job_response(request, scheduled_job, return_url)
+
+                        # Step 4: Immediate execution (no schedule, no approval)
                         scheduled_job.delete()
                         del scheduled_job
                         return self._handle_immediate_execution(
@@ -2911,28 +2940,8 @@ class JobUIViewSet(NautobotUIViewSet):
                             console_log,
                             return_url,
                         )
-                    # Step 1: Check if approval is required
-                    if scheduled_job_has_approval_workflow:
-                        return self._handle_approval_workflow_response(request, scheduled_job, return_url)
-
-                    # Step 3: If approval is not required
-                    if is_scheduled:
-                        return self._handle_scheduled_job_response(request, scheduled_job, return_url)
-
-                    # Step 4: Immediate execution (no schedule, no approval)
-                    scheduled_job.delete()
-                    del scheduled_job
-                    return self._handle_immediate_execution(
-                        request,
-                        job_model,
-                        job_class,
-                        job_form,
-                        profile,
-                        ignore_singleton_lock,
-                        job_queue,
-                        console_log,
-                        return_url,
-                    )
+            except ValidationError as e:
+                messages.error(request, f"Unable to run or schedule job: {'; '.join(e.messages)}")
 
         if return_url:
             return redirect(return_url)

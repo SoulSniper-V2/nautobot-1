@@ -43,7 +43,7 @@ from nautobot.extras.choices import (
     ObjectChangeEventContextChoices,
 )
 from nautobot.extras.context_managers import change_logging, JobHookChangeContext, web_request_context
-from nautobot.extras.jobs import BaseJob, get_job, get_jobs, run_console_log_job_and_return_job_result
+from nautobot.extras.jobs import BaseJob, get_job, get_jobs, run_console_log_job_and_return_job_result, run_job
 from nautobot.extras.jobs_cancel import (
     CancelFactory,
     CeleryStrategy,
@@ -2140,6 +2140,58 @@ class RunJobWithJobResultManagementCommandTestCase(TransactionTestCase):
         mock_executor_console_log.assert_not_called()
         mock_report_job_status.assert_called_once()
 
+    @mock.patch("nautobot.extras.management.commands.runjob_with_job_result.JobConsoleLogExecutor")
+    @mock.patch("nautobot.extras.management.commands.runjob_with_job_result.report_job_status")
+    def test_only_unfinished_job_results_are_run(self, mock_report_job_status, mock_executor_console_log):
+        """Command should run PENDING or STARTED job results and refuse job results that already finished."""
+        cases = [
+            {"status": JobResultStatusChoices.STATUS_PENDING, "runs": True},
+            {"status": JobResultStatusChoices.STATUS_STARTED, "runs": True},
+            {"status": JobResultStatusChoices.STATUS_SUCCESS, "runs": False},
+            {"status": JobResultStatusChoices.STATUS_FAILURE, "runs": False},
+            {"status": JobResultStatusChoices.STATUS_REVOKED, "runs": False},
+        ]
+        for case in cases:
+            with self.subTest(**case):
+                mock_executor_console_log.reset_mock()
+                self.job_result.status = case["status"]
+                self.job_result.save()
+
+                if case["runs"]:
+                    call_command("runjob_with_job_result", str(self.job_result.pk), "--data", "{}")
+                    mock_executor_console_log.return_value.execute.assert_called_once()
+                else:
+                    with self.assertRaises(CommandError) as err:
+                        call_command("runjob_with_job_result", str(self.job_result.pk), "--data", "{}")
+                    self.assertIn(f"invalid status {case['status']}", str(err.exception))
+                    mock_executor_console_log.assert_not_called()
+
+    @mock.patch("nautobot.extras.management.commands.runjob_with_job_result.JobConsoleLogExecutor")
+    @mock.patch("nautobot.extras.management.commands.runjob_with_job_result.report_job_status")
+    def test_retry_warning_is_logged_only_for_started_job_result(
+        self, mock_report_job_status, mock_executor_console_log
+    ):
+        """Command should log a retry warning when resuming a STARTED job result, and not for a PENDING one."""
+        for status, expected_warnings in (
+            (JobResultStatusChoices.STATUS_PENDING, 0),
+            (JobResultStatusChoices.STATUS_STARTED, 1),
+        ):
+            with self.subTest(status=status):
+                JobLogEntry.objects.filter(job_result=self.job_result).delete()
+                self.job_result.status = status
+                self.job_result.save()
+
+                call_command("runjob_with_job_result", str(self.job_result.pk), "--data", "{}")
+
+                self.assertEqual(
+                    JobLogEntry.objects.filter(
+                        job_result=self.job_result,
+                        log_level=LogLevelChoices.LOG_WARNING,
+                        grouping="initialization",
+                    ).count(),
+                    expected_warnings,
+                )
+
 
 class ExecuteJobResultManagementCommandTestCase(TransactionTestCase):
     def setUp(self):
@@ -2234,6 +2286,31 @@ class ExecuteJobResultManagementCommandTestCase(TransactionTestCase):
 
         self.job_result.refresh_from_db()
         self.assertIsNotNone(self.job_result.date_started)
+
+    @mock.patch("nautobot.extras.management.commands.execute_job_result.run_job")
+    @mock.patch("nautobot.extras.management.commands.execute_job_result.JobResult._sync_eager_result_to_job_result")
+    @mock.patch("nautobot.extras.management.commands.execute_job_result.validate_job_and_job_data", return_value={})
+    def test_job_result_is_started_while_job_runs(self, mock_validate, mock_sync, mock_run_job):
+        """JobResult should be in STARTED status while the job runs, whether it was PENDING or already STARTED."""
+        eager_result = mock.MagicMock()
+        eager_result.failed.return_value = False
+        status_during_run = []
+
+        def record_status(*args, **kwargs):
+            status_during_run.append(JobResult.objects.get(pk=self.job_result.pk).status)
+            return eager_result
+
+        mock_run_job.apply.side_effect = record_status
+
+        for initial_status in (JobResultStatusChoices.STATUS_PENDING, JobResultStatusChoices.STATUS_STARTED):
+            with self.subTest(initial_status=initial_status):
+                status_during_run.clear()
+                self.job_result.status = initial_status
+                self.job_result.save()
+
+                call_command("execute_job_result", str(self.job_result.pk))
+
+                self.assertEqual(status_during_run, [JobResultStatusChoices.STATUS_STARTED])
 
     @mock.patch("nautobot.extras.management.commands.execute_job_result.run_job")
     @mock.patch("nautobot.extras.management.commands.execute_job_result.JobResult._sync_eager_result_to_job_result")
@@ -2635,12 +2712,17 @@ class CeleryStrategyTestCase(_JobCancelTestBase):
     #    no SIGKILL sent.
     # ------------------------------------------------------------------ #
 
-    def test_terminate_reaps_when_worker_not_alive(self):
+    @mock.patch("nautobot.extras.jobs_cancel.celery_app.control.revoke")
+    def test_terminate_reaps_when_worker_not_alive(self, mock_celery_revoke):
         for status in JobResultStatusChoices.UNREADY_STATES:
             with self.subTest(status=status):
+                mock_celery_revoke.reset_mock()
                 job_result = self._make_job_result(status)
                 with self.assertLogs("nautobot.extras.jobs_cancel", level="INFO") as log_cm:
                     result = self.strategy.cancel(job_result, self.user)
+
+                # The message may still be queued in the broker, so workers must be told to skip it, but not killed.
+                mock_celery_revoke.assert_called_once_with(str(job_result.pk))
 
                 self.assertTrue(
                     any("Reaped dead job" in msg for msg in log_cm.output),
@@ -2658,9 +2740,10 @@ class CeleryStrategyTestCase(_JobCancelTestBase):
                 self.assertEqual(job_result.canceled_by, self.user)
                 self.assertIsNotNone(job_result.date_canceled)
 
+    @mock.patch("nautobot.extras.jobs_cancel.celery_app.control.revoke")
     @mock.patch("nautobot.extras.jobs_cancel.CeleryStrategy.liveness")
-    def test_cancel_reap_swallows_job_already_terminal_race(self, mock_liveness):
-        """NOT_RUNNING -> perform_reap, but the row is terminal under the lock -> no-op, no reaped payload."""
+    def test_cancel_reap_swallows_job_already_terminal_race(self, mock_liveness, mock_celery_cancel):
+        """NOT_RUNNING -> perform_reap, but the row is terminal under the lock -> no-op, no reaped payload, no revoke."""
         mock_liveness.return_value = JobLiveness.NOT_RUNNING
         for status in JobResultStatusChoices.UNREADY_STATES:
             with self.subTest(status=status):
@@ -2673,6 +2756,7 @@ class CeleryStrategyTestCase(_JobCancelTestBase):
                 self.assertEqual(result["job_result"], job_result)
                 self.assertIsNone(result["error"])
                 self.assertFalse(result["canceled"])
+                mock_celery_cancel.assert_not_called()
 
                 job_result.refresh_from_db()
                 self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_SUCCESS)
@@ -2684,6 +2768,25 @@ class CeleryStrategyTestCase(_JobCancelTestBase):
                     any(f"Job {job_result.pk} is already in terminal state" in msg for msg in log_cm.output),
                     f"Expected an info log about no action taken, got: {log_cm.output}",
                 )
+
+    def test_worker_skips_job_canceled_before_it_started(self):
+        """A worker that never got the revoke broadcast must still not run a job canceled while queued."""
+        job_result = self._make_job_result(JobResultStatusChoices.STATUS_PENDING)
+        JobResult.objects.filter(pk=job_result.pk).update(
+            status=JobResultStatusChoices.STATUS_REVOKED,
+            date_canceled=timezone.now(),
+        )
+
+        run_job.apply(args=[self.job_model.class_path], task_id=str(job_result.pk))
+
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.status, JobResultStatusChoices.STATUS_REVOKED)
+        self.assertTrue(
+            JobLogEntry.objects.filter(
+                job_result=job_result, message="Job was canceled before it started, skipping execution"
+            ).exists()
+        )
+        self.assertFalse(JobLogEntry.objects.filter(job_result=job_result, grouping="initialization").exists())
 
     @mock.patch("nautobot.extras.jobs_cancel.CeleryStrategy.liveness")
     def test_cancel_abandon_swallows_job_already_terminal_race(self, mock_liveness):
